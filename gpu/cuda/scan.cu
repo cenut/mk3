@@ -17,6 +17,8 @@
 #include <vector>
 #include <array>
 #include <algorithm>
+#include <getopt.h>
+#include <cuda_runtime.h>
 
 typedef uint8_t  uchar;
 typedef uint32_t uint;
@@ -824,18 +826,41 @@ __device__ inline EKey ckdPriv(const EKey &par, uint index, const Pt *gtab) {
     return c;
 }
 
-__device__ inline bool targetHit(const uchar *targets, uint count, const uchar h[20]) {
-    uint lo = 0, hi = count;
-    while (lo < hi) {
-        uint mid = (lo + hi) >> 1;
-        const uchar *t = targets + mid * 20;
-        int cmp = 0;
-        for (int i = 0; i < 20; i++) {
-            if (h[i] < t[i]) { cmp = -1; break; }
-            if (h[i] > t[i]) { cmp = 1; break; }
-        }
-        if (cmp == 0) return true;
-        if (cmp < 0) hi = mid; else lo = mid + 1;
+// Open-addressing hash table of 20-byte hash160 targets. Keeps per-candidate
+// lookup at O(1) so tens of thousands of targets cost the same as a few.
+struct TargetTable {
+    const uint *slots; // keyCount slots, each = first entry index + 1 (0 = empty)
+    const uint *next;  // entryCount slots, chain to next entry (UINT_MAX = end)
+    const uchar *progs; // entryCount x 20 bytes
+    uint keyCount, entryCount;
+};
+
+__device__ __forceinline__ uint targetKeyMask(uint keyCount) {
+    uint m = 1;
+    while (m < keyCount) m <<= 1;
+    return m - 1;
+}
+
+__device__ __forceinline__ uint h160Hash(const uchar h[20]) {
+    uint v = __ldg((const uint *)(h));
+    uint w = __ldg((const uint *)(h + 8));
+    uint x = __ldg((const uint *)(h + 16));
+    uint acc = v ^ rotr(v, 7) ^ w ^ rotr(w, 13) ^ x ^ rotr(x, 19);
+    acc *= 2654435761u;
+    return acc ^ (acc >> 16);
+}
+
+__device__ inline bool targetHit(const TargetTable T, const uchar h[20]) {
+    uint mask = targetKeyMask(T.keyCount);
+    uint slot = h160Hash(h) & mask;
+    uint e = __ldg(T.slots + slot);
+    while (e != 0) {
+        const uchar *t = T.progs + (e - 1) * 20;
+        bool eq = true;
+        for (int i = 0; i < 20; i++) if (h[i] != t[i]) { eq = false; break; }
+        if (eq) return true;
+        e = __ldg(T.next + (e - 1));
+        if (e == UINT_MAX) break;
     }
     return false;
 }
@@ -855,6 +880,14 @@ struct Hit {
     uchar priv[32];
     uchar h160[20];
 };
+// --dump-all record: every derived address, no private material.
+struct DumpRec {
+    uint pad, chipSkip, mixerSkip, chain, idx;
+    uint preTermsSessions, postTermsSessions;
+    uchar h160[20];
+    uchar _pad[4];
+};
+static const ulong DUMP_RING_CAP = 1ULL << 20; // ring buffer size in records (84 MB)
 
 // one-time G doublings table (thread 0)
 __global__ void setupG(Pt *table) {
@@ -955,9 +988,25 @@ __global__ void debugCandidate(uint pad, uint chipSkip, uint mixerSkip,
 }
 
 // One thread = one point in pad x chip-skip x mixer-skip space.
-__global__ void scanKernel(const uchar *targets, const uchar *words8,
+__device__ __forceinline__ void appendDump(ulong globalSeq, DumpRec *ring,
+                                           uint pad, uint chipSkip, uint mixerSkip,
+                                           uint preTermsSessions, uint postTermsSessions,
+                                           uint chain, uint idx, const uchar h[20]) {
+    ulong slot = globalSeq % DUMP_RING_CAP;
+    DumpRec r;
+    r.pad = pad; r.chipSkip = chipSkip; r.mixerSkip = mixerSkip;
+    r.chain = chain; r.idx = idx;
+    r.preTermsSessions = preTermsSessions; r.postTermsSessions = postTermsSessions;
+    for (int i = 0; i < 20; i++) r.h160[i] = h[i];
+    for (int i = 0; i < 4; i++) r._pad[i] = 0;
+    ring[slot] = r;
+}
+
+__global__ void scanKernel(const TargetTable targets, const uchar *words8,
                            const PathRange *paths, Hit *hits, uint *hitCnt,
-                           Params P, const Pt *gtab) {
+                           Params P, const Pt *gtab,
+                           int dumpAll, ulong dumpBase, DumpRec *dumpRing,
+                           ulong *totalDerived) {
     ulong local = ulong(blockIdx.x) * blockDim.x + threadIdx.x;
     if (local >= P.candidateCount) return;
 
@@ -1009,6 +1058,14 @@ __global__ void scanKernel(const uchar *targets, const uchar *words8,
     EKey acct = ckdPriv(coin, 0u|0x80000000u, gtab);
     uint activeChain = UINT32_MAX;
     EKey branch;
+    ulong seqBase = 0;
+    if (dumpAll) {
+        ulong tuplesPerCandidate = 0;
+        for (uint ri = 0; ri < P.pathRangeCount; ri++) tuplesPerCandidate += paths[ri].indexCount;
+        ulong oldTotal = atomicAdd(totalDerived, P.candidateCount * tuplesPerCandidate);
+        seqBase = dumpBase + oldTotal;
+    }
+    ulong mySeq = seqBase;
     for (uint rangeIndex = 0; rangeIndex < P.pathRangeCount; rangeIndex++) {
         PathRange range = paths[rangeIndex];
         if (range.chain != activeChain) {
@@ -1022,7 +1079,10 @@ __global__ void scanKernel(const uchar *targets, const uchar *words8,
             Pt pub; mulGTable(pub, leaf.key, gtab);
             uchar ser[33]; ptSerialize(pub, ser);
             uchar h[20]; hash160(ser, 33, h);
-            if (targetHit(targets, P.targetCount, h)) {
+            if (dumpAll) appendDump(mySeq++, dumpRing, pad, chipSkip, mixerSkip,
+                                    preTermsSessions, postTermsSessions,
+                                    range.chain, idx, h);
+            if (targetHit(targets, h)) {
                 uint slot = atomicAdd(hitCnt, 1u);
                 if (slot < 1024u) {
                     hits[slot].pad = pad;
@@ -1069,8 +1129,14 @@ static uint bech32Polymod(const int *values, int count) {
     return chk;
 }
 
-static int bech32Prog(const char *addr, uchar out[20]) {
-    size_t addrLen = strlen(addr);
+static int bech32Prog(const char *addrIn, uchar out[20]) {
+    char addrBuf[96];
+    size_t ai = 0;
+    for (; addrIn[ai] && ai < sizeof(addrBuf) - 1; ai++) addrBuf[ai] = addrIn[ai];
+    addrBuf[ai] = 0;
+    while (ai > 0 && (addrBuf[ai-1] == '\r' || addrBuf[ai-1] == ' ' || addrBuf[ai-1] == '\t')) addrBuf[--ai] = 0;
+    const char *addr = addrBuf;
+    size_t addrLen = ai;
     if (addrLen != 42 || addr[0] != 'b' || addr[1] != 'c' || addr[2] != '1') return -1;
     const char *sep = strrchr(addr, '1');
     if (sep != addr + 2) return -1;
@@ -1137,20 +1203,77 @@ static bool parsePathRange(const char *text, PathRange &out) {
     return true;
 }
 
+static void usage(const char *prog) {
+    fprintf(stderr,
+        "usage: %s -t targets.txt [-w words.txt] [-o hits.json]\n"
+        "  GPU selection (for multi-GPU sharding):\n"
+        "    -d N | -g N   CUDA device id to run on (default 0)\n"
+        "  Pad range (the primary work split across GPUs):\n"
+        "    -p START  -e END      pad range [START, END), max 2^32\n"
+        "  RNG flow model:\n"
+        "    -F S              firstboot flow with S pre-Terms sessions\n"
+        "    -A BASE -C COUNT  post-Terms session range (requires -F)\n"
+        "    -B BASE -k COUNT  fixed chip-skip range (not with -F)\n"
+        "    -m BASE -K COUNT  independent mixer-skip range (not with -F/-M)\n"
+        "    -M LOCKSTEP       lockstep chip/mixer skips (not with -F/-m/-K)\n"
+        "    -r RTC_TR -s RTC_SSR   rtc counters (default 0/0)\n"
+        "  Paths / batching:\n"
+        "    -P CHAIN:START:COUNT   BIP84 path range (repeatable)\n"
+        "    -i N                   number of receive indices (default 16)\n"
+        "    -b THREADS             threads per batch (default 4194304)\n"
+        "  Debug / dump:\n"
+        "    -D PAD                 single-candidate trace, then exit\n"
+        "    --dump-all             write every derived address to FILE (CSV via -o)\n"
+        "                           no private material; keep the pad range small\n",
+        prog);
+}
+
+// bech32 (BIP173) encoder for witness v0 20-byte programs -> bc1q...
+static std::string bech32EncodeSegwitV0(const uchar prog[20]) {
+    int vals[64]; int n = 0;
+    vals[n++] = 0; // witness version 0
+    uint acc = 0; int bits = 0;
+    for (int i = 0; i < 20; i++) {
+        acc = (acc << 8) | prog[i]; bits += 8;
+        while (bits >= 5) { bits -= 5; vals[n++] = int((acc >> bits) & 31u); }
+    }
+    if (bits) vals[n++] = int((acc << (5 - bits)) & 31u);
+    int chkInput[5 + 33 + 6] = {3, 3, 0, 2, 3}; // HRP expansion for "bc"
+    for (int i = 0; i < n; i++) chkInput[5 + i] = vals[i];
+    for (int i = 0; i < 6; i++) chkInput[5 + n + i] = 0;
+    uint pm = bech32Polymod(chkInput, 5 + n + 6) ^ 1u;
+    std::string addr = "bc1";
+    for (int i = 0; i < n; i++) addr += CHARSET[vals[i]];
+    for (int i = 0; i < 6; i++) addr += CHARSET[(pm >> (5 * (5 - i))) & 31u];
+    return addr;
+}
+
 int main(int argc, char **argv) {
     const char *targetsF = nullptr, *wordsF = "bip39_english.txt", *outF = "hits_gpu.json";
     uint rtcTR = 0, rtcSSR = 0, chipSkipCount = 8, idxCount = 16, chipSkipBase = 0;
     uint mixerSkipBase = 0, mixerSkipCount = 1, lockstep = 0;
     uint preTermsSessions = 2, postTermsBase = 0, postTermsCount = 1;
     ulong padStart = 0, padEnd = 1ULL << 32, batchThreads = 1u << 22;
+    int deviceId = 0;
     ulong debugPad = 0;
     bool debug = false, mixerConfigured = false, chipConfigured = false;
     bool firstBoot = false, postTermsConfigured = false, idxConfigured = false;
+    bool dumpAll = false;
     std::vector<PathRange> paths;
+    static struct option longOpts[] = {
+        {"dump-all", no_argument, nullptr, 1000},
+        {nullptr, 0, nullptr, 0}
+    };
+    int longIndex = 0;
     int opt;
-    while ((opt = getopt(argc, argv, "t:w:r:s:k:i:p:b:o:D:B:e:M:m:K:F:A:C:P:")) != -1) {
+    while ((opt = getopt_long(argc, argv, "t:w:r:s:k:i:p:b:o:D:B:e:M:m:K:F:A:C:P:d:g:h",
+                              longOpts, &longIndex)) != -1) {
         ulong value = 0;
         switch (opt) {
+        case 1000: dumpAll = true; break;
+        case 'd': if (!parseU64(optarg, INT_MAX, value)) goto bad_number; deviceId = int(value); break;
+        case 'g': if (!parseU64(optarg, INT_MAX, value)) goto bad_number; deviceId = int(value); break;
+        case 'h': usage(argv[0]); return opt == 'h' ? 0 : 2;
         case 'D': if (!parseU64(optarg, UINT32_MAX, value)) goto bad_number; debugPad = value; debug = true; break;
         case 'B': if (!parseU64(optarg, UINT32_MAX, value)) goto bad_number; chipSkipBase = uint(value); chipConfigured = true; break;
         case 'e': if (!parseU64(optarg, 1ULL << 32, value)) goto bad_number; padEnd = value; break;
@@ -1227,12 +1350,15 @@ bad_number:
         fprintf(stderr, "post-Terms session range exceeds uint32\n"); return 2;
     }
 
-    // targets -> sorted 20-byte progs
+    // targets -> unique 20-byte progs (order-independent), loaded into a
+    // chained hash table so lookup stays O(1) even with tens of thousands.
     std::vector<std::array<uchar, 20>> progs;
     {
         std::string ttext = readFile(targetsF);
         char *copy = strdup(ttext.c_str());
         for (char *line = strtok(copy, "\n"); line; line = strtok(NULL, "\n")) {
+            size_t ll = strlen(line);
+            while (ll && (line[ll-1] == '\r' || line[ll-1] == ' ')) line[--ll] = 0;
             if (strlen(line) < 10) continue;
             std::array<uchar, 20> p;
             if (bech32Prog(line, p.data()) != 0) { fprintf(stderr, "bad address: %s\n", line); return 2; }
@@ -1240,10 +1366,33 @@ bad_number:
         }
         free(copy);
     }
-    uint tcount = (uint)progs.size();
-    if (!tcount) { fprintf(stderr, "no valid targets loaded\n"); return 2; }
+    uint rawTargets = (uint)progs.size();
+    if (!rawTargets) { fprintf(stderr, "no valid targets loaded\n"); return 2; }
     std::sort(progs.begin(), progs.end());
-    fprintf(stderr, "[cscan] %u targets loaded\n", tcount);
+    progs.erase(std::unique(progs.begin(), progs.end()), progs.end());
+    uint tcount = (uint)progs.size();
+    fprintf(stderr, "[cscan] %u targets loaded (%u unique)\n", rawTargets, tcount);
+
+    // host-side hash table construction
+    uint keyCount = 1;
+    while (keyCount < tcount * 2u) keyCount <<= 1;
+    std::vector<uint> hSlots(keyCount, 0);
+    std::vector<uint> hNext(tcount);
+    auto h160HashHost = [](const uchar *h) -> uint {
+        uint v, w, x;
+        memcpy(&v, h, 4); memcpy(&w, h + 8, 4); memcpy(&x, h + 16, 4);
+        uint acc = v ^ ((v >> 7) | (v << 25)) ^ w ^ ((w >> 13) | (w << 19))
+                 ^ x ^ ((x >> 19) | (x << 13));
+        acc *= 2654435761u;
+        return acc ^ (acc >> 16);
+    };
+    for (uint e = 0; e < tcount; e++) {
+        uint slot = h160HashHost(progs[e].data()) & (keyCount - 1);
+        hNext[e] = hSlots[slot] ? hSlots[slot] - 1 : UINT_MAX;
+        hSlots[slot] = e + 1;
+    }
+
+    CUDA_CHECK(cudaSetDevice(deviceId));
 
     // wordlist -> 2048 x 8 zero-padded
     std::vector<uchar> words8(2048 * 8, 0);
@@ -1262,18 +1411,25 @@ bad_number:
     }
 
     uchar *dTargets, *dWords; PathRange *dPaths; Hit *dHits; uint *dCnt; Pt *dG;
+    uint *dSlots, *dNext;
     CUDA_CHECK(cudaMalloc(&dTargets, progs.size() * 20));
+    CUDA_CHECK(cudaMalloc(&dSlots, keyCount * sizeof(uint)));
+    CUDA_CHECK(cudaMalloc(&dNext, tcount * sizeof(uint)));
     CUDA_CHECK(cudaMalloc(&dWords, words8.size()));
     CUDA_CHECK(cudaMalloc(&dPaths, paths.size() * sizeof(PathRange)));
     CUDA_CHECK(cudaMalloc(&dHits, 1024 * sizeof(Hit)));
     CUDA_CHECK(cudaMalloc(&dCnt, 4));
     CUDA_CHECK(cudaMalloc(&dG, 256 * sizeof(Pt)));
     CUDA_CHECK(cudaMemcpy(dTargets, progs.data(), progs.size() * 20, cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dSlots, hSlots.data(), keyCount * sizeof(uint), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(dNext, hNext.data(), tcount * sizeof(uint), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dWords, words8.data(), words8.size(), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(dPaths, paths.data(), paths.size() * sizeof(PathRange), cudaMemcpyHostToDevice));
 
     setupG<<<1, 1>>>(dG);
     CUDA_CHECK(cudaDeviceSynchronize());
+
+    if (dumpAll && debug) { fprintf(stderr, "--dump-all cannot be combined with -D\n"); return 2; }
 
     if (debug) {
         uint debugMixerSkip = lockstep ? chipSkipBase : mixerSkipBase;
@@ -1328,7 +1484,34 @@ bad_number:
     ulong maxBatchThreads = ulong(props.maxGridSize[0]) * block;
     if (batchThreads > maxBatchThreads) batchThreads = maxBatchThreads;
 
+    DumpRec *dDumpRing = nullptr; ulong *dTotalDerived = nullptr;
+    std::vector<DumpRec> hostRing;
+    FILE *dumpF = nullptr;
+    ulong totalRecords = 0;
+    if (dumpAll) {
+        if (debug) { fprintf(stderr, "--dump-all cannot be combined with -D\n"); return 2; }
+        if (totalCandidates > UINT64_MAX / pathTupleCount) {
+            fprintf(stderr, "dump record count exceeds uint64\n"); return 2;
+        }
+        totalRecords = totalCandidates * pathTupleCount;
+        if (ulong(props.totalGlobalMem) < DUMP_RING_CAP * sizeof(DumpRec) + (128UL << 20)) {
+            fprintf(stderr, "device memory too small for --dump-all ring\n"); return 2;
+        }
+        CUDA_CHECK(cudaMalloc(&dDumpRing, DUMP_RING_CAP * sizeof(DumpRec)));
+        CUDA_CHECK(cudaMalloc(&dTotalDerived, 8));
+        CUDA_CHECK(cudaMemset(dTotalDerived, 0, 8));
+        hostRing.resize(DUMP_RING_CAP);
+        int dumpFd = open(outF, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
+        if (dumpFd >= 0 && fchmod(dumpFd, S_IRUSR | S_IWUSR) != 0) { perror(outF); close(dumpFd); dumpFd = -1; }
+        dumpF = dumpFd >= 0 ? fdopen(dumpFd, "w") : nullptr;
+        if (!dumpF) { perror(outF); return 2; }
+        fprintf(dumpF, "pad,chip_skip,mixer_skip,pre_terms_sessions,post_terms_sessions,chain,idx,h160,address\n");
+        fprintf(stderr, "[cscan] --dump-all: %llu records expected -> %s (CSV, no private keys)\n",
+                totalRecords, outF);
+    }
+
     double t0 = nowSec(), elapsed0 = 0;
+    ulong drained = 0;
     for (ulong candidateStart = 0; candidateStart < totalCandidates; ) {
         ulong threads = std::min(batchThreads, totalCandidates - candidateStart);
         Params P = {
@@ -1339,11 +1522,34 @@ bad_number:
         };
         CUDA_CHECK(cudaMemset(dCnt, 0, 4));
         uint grid = uint((threads + block - 1) / block);
-        scanKernel<<<grid, block>>>(dTargets, dWords, dPaths, dHits, dCnt, P, dG);
+        TargetTable TT = { dSlots, dNext, dTargets, keyCount, tcount };
+        scanKernel<<<grid, block>>>(TT, dWords, dPaths, dHits, dCnt, P, dG,
+                                    dumpAll ? 1 : 0, drained, dDumpRing, dTotalDerived);
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaDeviceSynchronize());
         uint hits;
         CUDA_CHECK(cudaMemcpy(&hits, dCnt, 4, cudaMemcpyDeviceToHost));
+        if (dumpAll) {
+            ulong newTotal = 0;
+            CUDA_CHECK(cudaMemcpy(&newTotal, dTotalDerived, 8, cudaMemcpyDeviceToHost));
+            ulong want = newTotal - drained;
+            if (want > DUMP_RING_CAP) want = DUMP_RING_CAP; // overflow: keep last records
+            if (want) {
+                ulong start = newTotal - want;
+                CUDA_CHECK(cudaMemcpy(hostRing.data(), dDumpRing + (start % DUMP_RING_CAP),
+                                      want * sizeof(DumpRec), cudaMemcpyDeviceToHost));
+                for (ulong i = 0; i < want; i++) {
+                    const DumpRec &R = hostRing[(start + i) % DUMP_RING_CAP];
+                    std::string addr = bech32EncodeSegwitV0(R.h160);
+                    fprintf(dumpF, "%u,%u,%u,%u,%u,%u,%u,", R.pad, R.chipSkip, R.mixerSkip,
+                            R.preTermsSessions, R.postTermsSessions, R.chain, R.idx);
+                    for (int j = 0; j < 20; j++) fprintf(dumpF, "%02x", R.h160[j]);
+                    fprintf(dumpF, ",%s\n", addr.c_str());
+                }
+                if (fflush(dumpF) != 0) { perror(outF); return 2; }
+            }
+            drained = newTotal;
+        }
         double dt = nowSec() - t0;
         double batchDt = dt - elapsed0; elapsed0 = dt;
         ulong done = candidateStart + threads;
@@ -1368,6 +1574,7 @@ bad_number:
             std::vector<Hit> H(n);
             CUDA_CHECK(cudaMemcpy(H.data(), dHits, n * sizeof(Hit), cudaMemcpyDeviceToHost));
             fprintf(stderr, "[HIT] %u match(es); private material only in chmod 0600 output\n", n);
+            if (dumpF) { fclose(dumpF); dumpF = nullptr; }
             int outFd = open(outF, O_WRONLY | O_CREAT | O_TRUNC, S_IRUSR | S_IWUSR);
             if (outFd >= 0 && fchmod(outFd, S_IRUSR | S_IWUSR) != 0) {
                 perror(outF);
@@ -1407,6 +1614,14 @@ bad_number:
             return 0;
         }
         candidateStart += threads;
+    }
+    if (dumpF) {
+        fprintf(stderr, "[cscan] dumped %llu/%llu address records to %s\n",
+                drained, totalRecords, outF);
+        bool writeFailed = ferror(dumpF) != 0;
+        if (fclose(dumpF) != 0) writeFailed = true;
+        if (writeFailed) { fprintf(stderr, "failed writing %s\n", outF); return 2; }
+        dumpF = nullptr;
     }
     fprintf(stderr, "[cscan] exhausted %llu candidates, no hit\n", totalCandidates);
     return 1;
